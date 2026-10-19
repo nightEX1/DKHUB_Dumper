@@ -17,13 +17,42 @@ local CLASSES_URL = ("https://raw.githubusercontent.com/%s/%s/main/Utils/Classes
 local LIMIT = 800000 -- ขนาดข้อมูลต่อ zip
 
 local SERVICES = {
-    -- โซนที่ฝั่ง client เห็น (ตรงกับ DumpTables ของรีโพ)
-    "ReplicatedStorage", "ReplicatedFirst", "SoundService",
-    "Workspace", "Lighting", "Teams",
-    -- โซนฝั่ง Server / Starter (โค้ดหลักของเกมตัวเอง)
-    "ServerScriptService", "ServerStorage",
-    "StarterGui", "StarterPlayer", "StarterPack",
+    "ReplicatedStorage",
+    "ReplicatedFirst",
+    "Workspace",
+    "ServerScriptService",
+    "ServerStorage",
+    "StarterGui",
+    "StarterPlayer",
+    "StarterPack",
 } -- ไม่มี Players (ใน Studio โหมด Edit ไม่มี LocalPlayer)
+
+-- ใช้แปลเฉพาะชื่อที่แสดงใน UI/Log/โฟลเดอร์ผลลัพธ์
+-- ชื่อ Service จริงใน game:GetService() และใน Source ยังเป็นภาษาอังกฤษเหมือนเดิม
+local SERVICE_LABELS = {
+    ReplicatedStorage = "ที่เก็บข้อมูลร่วม",
+    ReplicatedFirst = "เริ่มต้นร่วม",
+    Workspace = "พื้นที่เกม",
+    ServerScriptService = "สคริปต์เซิร์ฟเวอร์",
+    ServerStorage = "ที่เก็บเซิร์ฟเวอร์",
+    StarterGui = "ส่วนติดต่อผู้เล่น",
+    StarterPlayer = "ผู้เล่นเริ่มต้น",
+    StarterPack = "กระเป๋าเริ่มต้น",
+}
+
+local function serviceLabel(name)
+    return SERVICE_LABELS[name] or name
+end
+
+-- ตัวกรองผลลัพธ์: ซ่อนรายละเอียด Model/Player แต่ยังเก็บ Source ของ Script ไว้
+local FILTER = {
+    ExcludePlayerBranches = true,
+    HideModelNodes = true,
+    CategoryPatterns = {
+        Monster = {"monster", "monter", "mob", "enemy"},
+        Area = {"area", "พื้นที่", "zone", "region"},
+    },
+}
 
 ---------------- UI ----------------
 local function getParent()
@@ -209,7 +238,7 @@ local function sendPart(url, idx, total, zipData, note)
     local body = "--" .. b .. "\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n"
         .. "Content-Type: application/json\r\n\r\n" .. payload .. "\r\n"
         .. "--" .. b .. "\r\nContent-Disposition: form-data; name=\"files[0]\"; "
-        .. ("filename=\"workspace_part%d.zip\"\r\n"):format(idx)
+        .. "filename=\"all.zip\"\r\n"
         .. "Content-Type: application/zip\r\n\r\n" .. zipData .. "\r\n--" .. b .. "--\r\n"
     local lastErr = "unknown"
     for attempt = 1, 4 do
@@ -251,6 +280,38 @@ end
 
 ---------------- Dump ----------------
 local function clean(s) return (s:gsub('[<>:"/\\|?*%c]', "_")) end
+
+local function lower(s) return tostring(s):lower() end
+
+local function isPlayerBranch(inst)
+    if not FILTER.ExcludePlayerBranches then return false end
+    local cur = inst
+    while cur and cur ~= game do
+        local n = lower(cur.Name)
+        if cur:IsA("Player") or n == "players" or n == "player"
+            or n == "characters" or n == "character" then
+            return true
+        end
+        cur = cur.Parent
+    end
+    return false
+end
+
+local function categoryFor(path)
+    local p = lower(path)
+    for category, patterns in pairs(FILTER.CategoryPatterns) do
+        for _, needle in ipairs(patterns) do
+            if p:find(lower(needle), 1, true) then return category end
+        end
+    end
+    return nil
+end
+
+local function fileStem(path)
+    local s = path:gsub("%[", "_"):gsub("%]", "_")
+    s = s:gsub("[^%w%._%-]+", "_")
+    return s:gsub("_+", "_"):gsub("^_", ""):gsub("_$", "")
+end
 
 local function fmt(v)
     local t = typeof(v)
@@ -345,7 +406,7 @@ local function run(url)
     else log(errC) log("ดัมป์แบบไม่มี properties (โครงสร้าง+สคริปต์ยังครบ)") end
 
     local tree, remotes, curScripts, used = {}, {}, {}, {}
-    local svcTree, svcScripts = {}, {}
+    local svcTree, svcScripts, categorizedScripts = {}, {}, {Scripts = {}, Monster = {}, Area = {}}
     local readOk, readFail, empty = 0, 0, 0
 
     local function uniquePath(p)
@@ -364,6 +425,7 @@ local function run(url)
 
     local function walk(inst, prefix, isLast, dir)
         if stopped then return end
+        if isPlayerBranch(inst) then return end
         done += 1
         if done % 150 == 0 then
             progress(done / total * 40, "กำลัง dump : สแกนเกม")
@@ -373,8 +435,11 @@ local function run(url)
 
         local branch = isLast and "└── " or "├── "
         local childPrefix = prefix .. (isLast and "    " or "│   ")
-        table.insert(tree, prefix .. branch .. inst.Name .. " [" .. inst.ClassName .. "]")
-        for _, l in ipairs(propLines(inst, childPrefix .. "  · ")) do table.insert(tree, l) end
+        local hideNode = FILTER.HideModelNodes and inst:IsA("Model")
+        if not hideNode then
+            table.insert(tree, prefix .. branch .. inst.Name .. " [" .. inst.ClassName .. "]")
+            for _, l in ipairs(propLines(inst, childPrefix .. "  · ")) do table.insert(tree, l) end
+        end
 
         if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction")
             or inst:IsA("BindableEvent") or inst:IsA("BindableFunction") then
@@ -393,7 +458,20 @@ local function run(url)
                 if src == "" then empty += 1 else readOk += 1 end
                 body = src
             end
-            table.insert(curScripts, ("-- ===== Path : %s | Class : %s =====\n%s"):format(inst:GetFullName(), inst.ClassName, body))
+            local fullPath = inst:GetFullName()
+            local block = ("-- ===== Path : %s | Class : %s =====\n%s"):format(fullPath, inst.ClassName, body)
+            table.insert(curScripts, block)
+            table.insert(categorizedScripts.Scripts, {
+                name = fileStem(fullPath) .. ".lua",
+                data = block,
+            })
+            local category = categoryFor(fullPath)
+            if category then
+                table.insert(categorizedScripts[category], {
+                    name = fileStem(fullPath) .. ".lua",
+                    data = block,
+                })
+            end
         end
 
         local kids = inst:GetChildren()
@@ -409,7 +487,7 @@ local function run(url)
     end
     for i, s in ipairs(svcs) do
         if stopped then break end
-        log("สแกน " .. s[1])
+        log("สแกน " .. serviceLabel(s[1]) .. " (" .. s[1] .. ")")
         tree, curScripts = {}, {}
         walk(s[2], "", true, clean(s[1]))
         svcTree[s[1]] = tree
@@ -461,40 +539,46 @@ local function run(url)
         local parts = {
             ("-- Dev.DKHUB | %s | scripts: %d"):format(name, #(svcScripts[name] or {})),
             "",
-            table.concat(svcScripts[name] or {}, "\n\n"),
-            "",
-            "-- ===== EXPLORER =====",
+            "-- Source ของ Script แยกไว้ใน workspace/Scripts/ และหมวด Monster/Area",
         }
-        for _, l in ipairs(svcTree[name] or {}) do table.insert(parts, "-- " .. l) end
-        splitText(root .. clean(name), ".lua", table.concat(parts, "\n"), list)
+        if #(svcTree[name] or {}) > 0 then
+            table.insert(parts, "")
+            table.insert(parts, "-- ===== EXPLORER (models/players hidden) =====")
+            for _, l in ipairs(svcTree[name] or {}) do table.insert(parts, "-- " .. l) end
+        end
+        splitText(root .. "Services/" .. clean(serviceLabel(name)), ".lua", table.concat(parts, "\n"), list)
+    end
+
+    -- แยกไฟล์ตามชื่อที่ค้นพบ เพื่อให้ใช้ทำสคริปต์ต่อได้ง่าย
+    for category, files in pairs(categorizedScripts) do
+        local seen = {}
+        for _, f in ipairs(files) do
+            local name = f.name
+            if seen[name] then
+                seen[name] += 1
+                name = name:gsub("%.lua$", "_" .. seen[f.name] .. ".lua")
+            else
+                seen[name] = 1
+            end
+            table.insert(list, {root .. category .. "/" .. name, f.data})
+        end
     end
 
     ---------------- zip ----------------
     progress(40, "กำลัง dump : บีบ zip")
-    local groups, cur, curSize = {}, {}, 0
-    for _, f in ipairs(list) do
-        if curSize + #f[2] > LIMIT and #cur > 0 then
-            table.insert(groups, cur); cur, curSize = {}, 0
-        end
-        table.insert(cur, f); curSize += #f[2]
-    end
-    if #cur > 0 then table.insert(groups, cur) end
-
-    local zips = {}
-    for i, g in ipairs(groups) do
-        if stopped then progress(0, "หยุดแล้ว") return end
-        zips[i] = makeZip(g)
-        progress(40 + i / #groups * 20, ("กำลัง dump : บีบ zip %d/%d"):format(i, #groups))
-        task.wait()
-    end
-    log(("สร้าง zip %d ก้อน (%d ไฟล์)"):format(#zips, #list))
+    -- สร้าง ZIP เดียวตามที่ต้องการ: all.zip
+    if stopped then progress(0, "หยุดแล้ว") return end
+    local zipData = makeZip(list)
+    local zips = {{name = "all.zip", data = zipData}}
+    progress(60, ("กำลัง dump : สร้าง all.zip (%d ไฟล์)"):format(#list))
+    log(("สร้าง all.zip (%d ไฟล์ | %d bytes)"):format(#list, #zipData))
 
     ---------------- ส่ง ----------------
     local failed = 0
     for i, z in ipairs(zips) do
         if stopped then progress(0, "หยุดแล้ว") return end
         progress(60 + (i - 1) / #zips * 40, ("กำลังส่ง Webhook %d/%d"):format(i, #zips))
-        local ok, err = sendPart(url, i, #zips, z, i == 1 and ("scripts " .. readOk) or nil)
+        local ok, err = sendPart(url, i, #zips, z.data, i == 1 and (z.name .. " | scripts " .. readOk) or nil)
         if ok then log(("ส่ง part %d/%d สำเร็จ"):format(i, #zips))
         else failed += 1 log(("part %d ล้มเหลว: %s"):format(i, tostring(err))) end
         task.wait(1)
